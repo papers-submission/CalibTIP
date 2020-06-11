@@ -8,3 +8,4 @@ To repreduce the results
 sh scripts/advanced_pipeline.sh
 sh scripts/light_pipeline.sh
 ```
+To reproduce BERT-base results please follow the instruction in BERT-base folder
