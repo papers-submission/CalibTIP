@@ -32,7 +32,7 @@ from ast import literal_eval
 import pandas as pd
 from transformers.mse_optimization import *
 import transformers.modeling_quantize as mq
-
+from functools import partial
 
 from transformers import (
     MODEL_FOR_QUESTION_ANSWERING_MAPPING,
@@ -281,7 +281,7 @@ def evaluate(args, model, tokenizer, prefix="",num_steps=1e6,calib_data=True):
     # Note that DistributedSampler samples randomly
     eval_sampler = SequentialSampler(dataset)
     # eval_dataloader = DataLoader(dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
-    eval_dataloader = DataLoader(dataset, shuffle=True, batch_size=args.eval_batch_size)
+    eval_dataloader = DataLoader(dataset, shuffle=not args.seq_adaquant, batch_size=args.eval_batch_size)
 
     # multi-gpu evaluate
     if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
@@ -664,6 +664,7 @@ def main():
 
     parser.add_argument("--threads", type=int, default=1, help="multiple threads for converting example to features")
     parser.add_argument("--optimize_weights", action="store_true", help="perform mse based weights optimization")
+    parser.add_argument("--seq_adaquant", action="store_true", help="perform sequential adaquant weights optimization")
 
     parser.add_argument('--quant-config', default='',
                     help='additional quantization configuration')
@@ -824,6 +825,12 @@ def main():
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
         
         cached_input_output={}
+        def Qhook(name,module, input, output):
+            if module not in cached_qinput:
+                cached_qinput[module] = []
+            # Meanwhile store data in the RAM.
+            cached_qinput[module].append([inp.detach().cpu() for inp in input])
+            
         def hook(module, input, output):
             if module not in cached_input_output:
                 cached_input_output[module] = []
@@ -878,8 +885,22 @@ def main():
                         f.write(",".join(col) + "\n")
                 #Run optimization
                 mse_df = pd.DataFrame(index=np.arange(len(cached_input_output)), columns=['name', 'bit', 'shape', 'mse_before', 'mse_after'])
-                print_freq = 30
+                print_freq = 300
                 for i, layer in enumerate(cached_input_output):
+                    if i>0 and args.seq_adaquant:
+                        count = 0
+                        cached_qinput = {}
+                        for name, m in model.named_modules():
+                            if layer.name==name:
+                                if count < 1000:
+                                    handler= m.register_forward_hook(partial(Qhook,name))
+                                    count += 1
+                        # Store input/output for all quantizable layers
+                        evaluate(args, model, tokenizer, prefix=global_step,num_steps=20)
+                        print("cashed quant Input%s"%layer.name)
+
+                        cached_input_output[layer][0] = (cached_qinput[layer][0],cached_input_output[layer][0][1])
+                        handler.remove()                                        
                     is_embedding = layer.__class__.__name__ == 'QEmbedding'
                     is_weight = 'weight' in dir(layer) and not is_embedding
                     weight_shape = layer.weight.shape if is_weight else '-'
@@ -908,10 +929,12 @@ def main():
 
                 filename = args.output_dir + '/model.adaquant'
                 torch.save(model.state_dict(), filename)
+            del cached_input_output    
+            torch.cuda.empty_cache()    
             if config.measure:
                 result = evaluate(args, model, tokenizer, prefix=global_step,num_steps=300)
             else:    
-                result = evaluate(args, model, tokenizer, prefix=global_step)
+                result = evaluate(args, model, tokenizer, prefix=global_step,calib_data=False)
             logging.info(results)
 
             if result is not None:
