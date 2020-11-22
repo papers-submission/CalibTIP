@@ -17,7 +17,7 @@ from utils.optim import OptimRegime
 from utils.cross_entropy import CrossEntropyLoss
 from utils.misc import torch_dtypes
 from utils.param_filter import FilterModules, is_bn
-
+from utils.convert_pytcv_model import convert_pytcv_model
 from datetime import datetime
 from ast import literal_eval
 from trainer import Trainer
@@ -36,11 +36,12 @@ import shutil
 from models.modules.quantize import QParams
 import ast
 import ntpath
-
+from functools import partial
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
                      and callable(models.__dict__[name]))
+
 parser = argparse.ArgumentParser(description='PyTorch ConvNet Training')
 
 parser.add_argument('--results-dir', metavar='RESULTS_DIR', default='./results',
@@ -169,7 +170,9 @@ parser.add_argument('--mixed_builder', action='store_true', default=False,
 parser.add_argument('--suffix', default='', type=str,
                     help='suffix to add to saved mixed-ip results')                    
 parser.add_argument('--adaquant', action='store_true', default=False,
-                    help='Applying Adaquant MSE minimization')       
+                    help='Applying Adaquant MSE minimization'),
+parser.add_argument('--seq_adaquant', action='store_true', default=False,
+                    help='Applying sequential Adaquant MSE minimization')                             
 parser.add_argument('--per-layer', action='store_true', default=False,
                     help='Applying per-layer for IP mixed-precision')       
 parser.add_argument('--mixed-builder', action='store_true', default=False,
@@ -269,10 +272,15 @@ def main_worker(args):
             import torchvision
             exec_lfv_str = 'torchvision.models.' + args.load_from_vision + '(pretrained=True)'
             model = eval(exec_lfv_str)
+            if 'pytcv' in args.model:
+                from pytorchcv.model_provider import get_model as ptcv_get_model
+                exec_lfv_str ='ptcv_get_model("'+ args.load_from_vision +'", pretrained=True)'
+                model_pytcv = eval(exec_lfv_str)
+                model = convert_pytcv_model(model,model_pytcv)
         else:
             if not os.path.isfile(args.absorb_bn):
                 parser.error('invalid checkpoint: {}'.format(args.evaluate))
-            model = model_(**model_config)
+            model = model(**model_config)
             checkpoint = torch.load(args.absorb_bn,map_location=lambda storage, loc: storage)
             checkpoint = checkpoint['state_dict'] if 'state_dict' in checkpoint.keys() else checkpoint
             model.load_state_dict(checkpoint,strict=False)
@@ -284,9 +292,12 @@ def main_worker(args):
         else:    
             filename_bn = save_path+'/'+args.model+'.with_bn'
             torch.save(model.state_dict(),filename_bn)
-        if args.load_from_vision: return
-           
-    model = model(**model_config)
+        if (args.load_from_vision or args.absorb_bn) and not args.evaluate_init_configuration: return
+
+    if 'inception' in args.model:
+        model = model(init_weights=False, **model_config)
+    else:
+        model = model(**model_config)
     logging.info("created model with configuration: %s", model_config)
     
     num_parameters = sum([l.nelement() for l in model.parameters()])
@@ -307,7 +318,7 @@ def main_worker(args):
             model.load_state_dict(checkpoint['state_dict'])
             logging.info("loaded checkpoint '%s'", args.evaluate)
         else:
-            model.load_state_dict(checkpoint,strict=False)    
+            model.load_state_dict(checkpoint,strict=False)
             logging.info("loaded checkpoint '%s'",args.evaluate)
           
 
@@ -371,13 +382,13 @@ def main_worker(args):
     
     train_data = DataRegime(getattr(model, 'data_regime', None),
                             defaults={'datasets_path': args.datasets_dir, 'name': args.dataset, 'split': 'train', 'augment': False,
-                                      'input_size': args.input_size,  'batch_size': args.batch_size, 'shuffle': True,
+                                      'input_size': args.input_size,  'batch_size': args.batch_size, 'shuffle': not args.seq_adaquant,
                                       'num_workers': args.workers, 'pin_memory': True, 'drop_last': True,
                                       'distributed': args.distributed, 'duplicates': args.duplicates, 'autoaugment': args.autoaugment,
                                       'cutout': {'holes': 1, 'length': 16} if args.cutout else None})
     if args.names_sp_layers is None and args.layers_precision_dict is None:
         args.names_sp_layers =  [key[:-7] for key in model.state_dict().keys() if 'weight' in key and 'running' not in key and ('conv' in key or 'downsample.0' in key or 'fc' in key)]
-        if args.keep_first_last: args.names_sp_layers=[name for name in args.names_sp_layers if name!='conv1' and name!='fc']
+        if args.keep_first_last: args.names_sp_layers=[name for name in args.names_sp_layers if name!='conv1' and name!='fc' and name != 'Conv2d_1a_3x3.conv']
         args.names_sp_layers = [k for k in args.names_sp_layers if 'downsample' not in k] if args.ignore_downsample else args.names_sp_layers
         if args.num_sp_layers == 0 and not args.keep_first_last:
             args.names_sp_layers = []
@@ -410,23 +421,31 @@ def main_worker(args):
          '.quantize_weight.running_zero_point', '.quantize_weight.running_range','.quantize_input1.running_zero_point', '.quantize_input1.running_range'
          '.quantize_input2.running_zero_point', '.quantize_input2.running_range']        
     if args.adaquant:
-        def hook(module, input, output):
+        def Qhook(name,module, input, output):
+            if module not in cached_qinput:
+                cached_qinput[module] = []
+            # Meanwhile store data in the RAM.
+            cached_qinput[module].append(input[0].detach().cpu())
+            # print(name)
+
+        def hook(name,module, input, output):
             if module not in cached_input_output:
                 cached_input_output[module] = []
             # Meanwhile store data in the RAM.
             cached_input_output[module].append((input[0].detach().cpu(), output.detach().cpu()))
-            print(module.__str__()[:70])
+            # print(name)
 
         from models.modules.quantize import QConv2d, QLinear
         handlers = []
         count = 0
-        for m in model.modules():
+        for name, m in model.named_modules():
             if isinstance(m, QConv2d) or isinstance(m, QLinear):
+            #if isinstance(m, QConv2d) or isinstance(m, QLinear):
             # if isinstance(m, QConv2d):
                 m.quantize = False
                 if count < 1000:
                 # if (isinstance(m, QConv2d) and m.groups == 1) or isinstance(m, QLinear):
-                    handlers.append(m.register_forward_hook(hook))
+                    handlers.append(m.register_forward_hook(partial(hook,name)))
                     count += 1
 
         # Store input/output for all quantizable layers
@@ -443,9 +462,22 @@ def main_worker(args):
         mse_df = pd.DataFrame(index=np.arange(len(cached_input_output)), columns=['name', 'bit', 'shape', 'mse_before', 'mse_after'])
         print_freq = 100
         for i, layer in enumerate(cached_input_output):
+            if i>0 and args.seq_adaquant:
+                count = 0
+                cached_qinput = {}
+                for name, m in model.named_modules():
+                    if layer.name==name:
+                        if count < 1000:
+                            handler= m.register_forward_hook(partial(Qhook,name))
+                            count += 1
+                # Store input/output for all quantizable layers
+                trainer.validate(train_data.get_loader())
+                print("cashed quant Input%s"%layer.name)
+                cached_input_output[layer][0] = (cached_qinput[layer][0],cached_input_output[layer][0][1])
+                handler.remove()            
             print("\nOptimize {}:{} for {} bit of shape {}".format(i, layer.name, layer.num_bits, layer.weight.shape))
             mse_before, mse_after, snr_before, snr_after, kurt_in, kurt_w = \
-                optimize_layer(layer, cached_input_output[layer], args.optimize_weights)
+                optimize_layer(layer, cached_input_output[layer], args.optimize_weights, batch_size=args.batch_size, model_name=args.model)
             print("\nMSE before optimization: {}".format(mse_before))
             print("MSE after optimization:  {}".format(mse_after))
             mse_df.loc[i, 'name'] = layer.name
@@ -457,10 +489,6 @@ def main_worker(args):
             mse_df.loc[i, 'snr_after'] = snr_after
             mse_df.loc[i, 'kurt_in'] = kurt_in
             mse_df.loc[i, 'kurt_w'] = kurt_w
-            if i > 0 and i % print_freq == 0:
-                print('\n')
-                val_results = trainer.validate(val_data.get_loader())
-                logging.info(val_results)
 
         mse_csv = args.evaluate + '.mse.csv'
         mse_df.to_csv(mse_csv)
@@ -625,16 +653,18 @@ def main_worker(args):
             else:
                 df = pd.read_csv(args.res_log, index_col=0)
 
-            ckp = ntpath.basename(args.resume)
+            ckp = ntpath.basename(args.evaluate)
             if 'bn_tuning' in ckp:
                 ckp = ckp.replace('.bn_tuning', '')
-            df.loc[ckp, 'acc_bias_tuning'] = best_prec1
+            df.loc[ckp, 'acc_bias_tuning'] = val_results['prec1']
             df.to_csv(args.res_log)
         # import pdb; pdb.set_trace()
     else:
         #print('Please Choose one of the following ....')
         if model_config['measure']:
             results = trainer.validate(train_data.get_loader(),rec=args.rec)
+            # results = trainer.validate(val_data.get_loader())
+            # print(results)
         else: 
             if args.evaluate_init_configuration:   
                 results = trainer.validate(val_data.get_loader())
